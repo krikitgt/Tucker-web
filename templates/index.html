@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Tucker — local chatbot</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="app">
+    <header>
+      <h1>Tucker</h1>
+      <p class="subtitle">Simple local chatbot — no API keys. Run in Chrome.</p>
+    </header>
+
+    <main id="chat-area">
+      <div id="messages" class="messages"></div>
+    </main>
+
+    <form id="input-form" class="input-form" autocomplete="off">
+      <input id="message-input" placeholder="Type a message (try: hello, 2+2, remember name is Alex)" />
+      <button type="submit">Send</button>
+    </form>
+
+    <footer>
+      <small>Conversation is stored on the server while it runs: <code>tucker_conversation.jsonl</code></small>
+    </footer>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
