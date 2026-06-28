@@ -9,16 +9,20 @@ import uuid
 from pathlib import Path
 from tucker_core import process_input, log_turn
 import json
+import os
+from datetime import datetime
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 
 LOG_FILE = Path("tucker_conversation.jsonl")
+
 
 def get_session_id():
     sid = request.cookies.get("tucker_sid")
     if not sid:
         sid = str(uuid.uuid4())
     return sid
+
 
 @app.route("/")
 def index():
@@ -27,6 +31,7 @@ def index():
     resp.set_cookie("tucker_sid", sid)
     return resp
 
+
 @app.route("/api/chat", methods=["POST"])
 def api_chat():
     data = request.get_json(force=True, silent=True) or {}
@@ -34,8 +39,10 @@ def api_chat():
     session_id = get_session_id()
     reply = process_input(message, session_id=session_id)
     # Log the turn with session id
+    ts = datetime.utcnow().isoformat() + "Z"
     log_turn(message, reply, session_id=session_id, log_file=LOG_FILE)
-    return jsonify({"reply": reply})
+    return jsonify({"reply": reply, "timestamp": ts})
+
 
 @app.route("/api/history", methods=["GET"])
 def api_history():
@@ -56,7 +63,10 @@ def api_history():
         pass
     return jsonify({"history": res})
 
+
 if __name__ == "__main__":
     import logging
     logging.basicConfig(level=logging.INFO)
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    host = os.environ.get("HOST", "127.0.0.1")
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host=host, port=port, debug=False)

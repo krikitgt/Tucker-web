@@ -1,22 +1,39 @@
 #!/usr/bin/env python3
 """
-Tucker core logic refactored for use by the Flask app.
-Provides:
-- process_input(message, session_id=...) -> reply
-- safe math evaluation
-- per-session ephemeral memory
-- logging helper log_turn(...)
+Tucker core logic with persistent memory (SQLite) and improved response handling.
+This file replaces the previous in-memory-only memory with a simple SQLite-backed store
+and includes a small FAQ and improved question handling for better responses.
 """
 import re
 import ast
 import operator
 import random
 import json
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 
-# In-memory per-session memory: { session_id: { key: value } }
-_session_memory = {}
+DB_PATH = Path("tucker_memory.db")
+
+# Initialize DB
+def _init_db():
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memories (
+                session_id TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                PRIMARY KEY(session_id, key)
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+_init_db()
 
 # ---- Jokes ----
 JOKES = [
@@ -25,6 +42,14 @@ JOKES = [
     "Why do Java programmers have to wear glasses? Because they don't C#.",
     "I told my computer I needed a break, and it said 'No problem — I'll go to sleep.'"
 ]
+
+# ---- Simple FAQ / knowledge base ----
+FAQ = {
+    "what is your name": "I'm Tucker, a small local chatbot running on this server.",
+    "who made you": "You did — or at least you created the project where I run.",
+    "what can you do": "I can do basic math, tell jokes, remember short facts for you, and have small conversations.",
+    "how do i run this": "Run `python app.py` and open the web UI in your browser at http://127.0.0.1:5000.",
+}
 
 # ---- Safe arithmetic evaluation using AST ----
 ALLOWED_OPERATORS = {
@@ -39,12 +64,14 @@ ALLOWED_OPERATORS = {
     ast.USub: operator.neg,
 }
 
+
 def safe_eval(expr: str):
     try:
         node = ast.parse(expr, mode="eval")
     except SyntaxError:
         raise ValueError("Syntax error in expression.")
     return _eval_node(node.body)
+
 
 def _eval_node(node):
     if isinstance(node, ast.BinOp):
@@ -69,27 +96,41 @@ def _eval_node(node):
     else:
         raise ValueError("Unsupported expression element.")
 
-# ---- Memory helpers ----
-def _get_store(session_id):
-    if session_id not in _session_memory:
-        _session_memory[session_id] = {}
-    return _session_memory[session_id]
+# ---- Memory helpers (SQLite-backed) ----
 
 def store_memory(session_id, key, value):
-    store = _get_store(session_id)
-    store[key.lower()] = value
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute(
+            "REPLACE INTO memories(session_id, key, value) VALUES (?, ?, ?)",
+            (session_id, key.lower(), value),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
 
 def recall_memory(session_id, key):
-    store = _get_store(session_id)
-    return store.get(key.lower())
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.execute(
+            "SELECT value FROM memories WHERE session_id = ? AND key = ?",
+            (session_id, key.lower()),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
 
 # ---- Logging ----
-def log_turn(user_text, bot_text, session_id=None, log_file: Path = Path("tucker_conversation.jsonl")):
+LOG_FILE = Path("tucker_conversation.jsonl")
+
+def log_turn(user_text, bot_text, session_id=None, log_file: Path = LOG_FILE):
     entry = {
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "session_id": session_id,
         "user": user_text,
-        "tucker": bot_text
+        "tucker": bot_text,
     }
     try:
         with log_file.open("a", encoding="utf-8") as f:
@@ -97,7 +138,50 @@ def log_turn(user_text, bot_text, session_id=None, log_file: Path = Path("tucker
     except Exception:
         pass
 
-# ---- Main processing ----
+# ---- Better response processing ----
+
+def _clean_text(text: str) -> str:
+    return re.sub(r"[^a-z0-9\s\?]", " ", text.lower()).strip()
+
+
+def _match_faq(text: str):
+    t = _clean_text(text)
+    for q, a in FAQ.items():
+        if q in t:
+            return a
+    return None
+
+
+def _is_math_expression(text: str) -> bool:
+    return bool(re.fullmatch(r"[\d\s\.\+\-\*\/\%\^\(\)]+", text.strip()))
+
+
+def _try_answer_question(text: str, session_id: str):
+    # 1) FAQ
+    faq = _match_faq(text)
+    if faq:
+        return faq
+
+    # 2) Memory recall: "what is my X" patterns
+    m = re.match(r"what(?:'s| is)? my (?P<k>[\w\s]+)\??$", text.strip(), re.I)
+    if m:
+        val = recall_memory(session_id, m.group("k").strip())
+        if val:
+            return f"Your {m.group('k').strip()} is '{val}'."
+        else:
+            return f"I don't have anything stored for '{m.group('k').strip()}'. You can say 'remember {m.group('k').strip()} is ...'."
+
+    # 3) Simple heuristics for 'how to' or 'how do i'
+    if re.search(r"\bhow (do i|to)\b", text.lower()):
+        return (
+            "If you tell me the exact task, I can give step-by-step advice. For many tasks, a good approach is:\n"
+            "1) define the goal, 2) break it into small steps, 3) try one step and observe results, 4) iterate."
+        )
+
+    # 4) Fallback polite answer
+    return None
+
+
 def process_input(text: str, session_id: str = "default"):
     text_clean = (text or "").strip()
     if not text_clean:
@@ -105,6 +189,7 @@ def process_input(text: str, session_id: str = "default"):
 
     low = text_clean.lower()
 
+    # Simple commands
     if low in ("quit", "exit", "bye", "goodbye", "q"):
         return "Goodbye — Tucker signing off."
 
@@ -120,8 +205,9 @@ def process_input(text: str, session_id: str = "default"):
             "- 'save' to save conversation to file (server-side)"
         )
 
+    # Greeting
     if re.search(r"\b(hello|hi|hey|greetings|yo)\b", low):
-        return random.choice(["Hi, I'm Tucker. How can I help?", "Hello — Tucker here! What's up?"])
+        return random.choice(["Hi, I'm Tucker. How can I help?", "Hello — Tucker here! What's up?", "Hey! What would you like to do today?"])
 
     if re.search(r"\b(how are you|how's it going|how do you do)\b", low):
         return random.choice(["I'm a program, so I'm always okay. How are you?", "Doing fine! Ready to chat."])
@@ -145,17 +231,7 @@ def process_input(text: str, session_id: str = "default"):
         store_memory(session_id, key, val)
         return f"I'll remember that your {key} is '{val}'."
 
-    # Recall
-    m = re.match(r"what(?:'s| is)? my (?P<k>[\w\s]+)\??$", text_clean, re.I)
-    if m:
-        key = m.group("k").strip()
-        val = recall_memory(session_id, key)
-        if val:
-            return f"Your {key} is '{val}'."
-        else:
-            return f"I don't have anything stored for '{key}'. You can say 'remember {key} is ...'."
-
-    # Calculate
+    # Calculation commands
     m = re.match(r"^(?:calculate|calc)\s+(?P<expr>.+)$", text_clean, re.I)
     if m:
         expr = m.group("expr").replace("^", "**")
@@ -165,8 +241,8 @@ def process_input(text: str, session_id: str = "default"):
         except Exception as e:
             return f"Couldn't calculate that: {e}"
 
-    # Bare expression detection
-    if re.fullmatch(r"[\d\s\.\+\-\*\/\%\^\(\)]+", text_clean):
+    # Bare math expression
+    if _is_math_expression(text_clean):
         expr = text_clean.replace("^", "**")
         try:
             result = safe_eval(expr)
@@ -174,13 +250,22 @@ def process_input(text: str, session_id: str = "default"):
         except Exception as e:
             return f"Couldn't evaluate expression: {e}"
 
-    if "?" in text_clean:
-        return "That's an interesting question. I don't know everything, but I can help with basic math, remembering facts, and small talk."
+    # If it's a question, try to answer more intelligently
+    if "?" in text_clean or text_clean.endswith("how") or text_clean.lower().startswith("how"):
+        ans = _try_answer_question(text_clean, session_id)
+        if ans:
+            return ans
+        else:
+            # Try a more helpful fallback
+            return (
+                "That's an interesting question. I might not know everything, but I can try to help. "
+                "Try asking in a bit more detail or tell me the context, and I'll provide step-by-step guidance."
+            )
 
+    # Generic small-talk improvements
     replies = [
-        "Tell me more.",
-        "I see. What else?",
-        "Okay — and what would you like me to do with that?",
-        "Thanks for telling me. I can remember short facts if you say 'remember ... is ...'."
+        "Tell me more — the more details, the better I can help.",
+        "I see. What specifically would you like me to do with that information?",
+        "Okay — I can remember that if you say 'remember ... is ...', or I can help with calculations and simple instructions.",
     ]
     return random.choice(replies)
